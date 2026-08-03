@@ -2,37 +2,58 @@
 
 Image models show up in product work. For each output you need clear answers. Did it meet the hard requirements? Where did it fail? Is the next model better?
 
-Good image evals follow a simple order. Check hard requirements first. Then score quality. Then tag the failure so the next fix is concrete. OpenAI lays this out in their [image evals cookbook](https://developers.openai.com/cookbook/examples/multimodal/image_evals).
+## Glossary
 
-Before you can run a single eval, you need an image-eval harness. The harness stores each prompt and its criteria, calls generate or edit, keeps the output images, runs the judge, and lets you compare runs. Building and keeping that harness is usually what slows teams down. Time goes into runners and glue instead of into better prompts and models. Some teams skip image evals for that reason.
+Image-eval terms used in this README. Broader agent-eval vocabulary is in Anthropic's [Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents).
 
-This repo follows the cookbook's grading method and example jobs. [Pixeltable](https://docs.pixeltable.com/) is the harness. You store prompts, settings, and output images in tables, call the image models and judge from computed columns, and score a batch when you set `eval_ready`. You still write rubrics, prompts, and pass rules.
+| Term | Meaning |
+|------|---------|
+| Evaluation (eval) | Give an image model a prompt (and optional reference images), get an image out, then grade that image. |
+| Harness | The infrastructure that runs evals end to end. |
+| Criteria | What "good" means for this prompt. Sent to the judge with the image. |
+| Rubric | Judge instructions, score schema, gates, and failure-tag rules for one kind of image work. |
+| Judge | Vision model that scores an image against the rubric. |
+| Gate | Hard pass/fail check. If it fails, the output failed even if the image looks good. |
+| Graded score | A 0 to 5 quality score used after gates clear, so you can rank outputs. |
+| Failure tag | Short label for how it failed, e.g. `text_garbled` or `identity_drift`. |
+| Verdict | Final pass or fail after gates and scores. |
+
+Good image evals follow a simple order ([OpenAI image evals cookbook](https://developers.openai.com/cookbook/examples/multimodal/image_evals)):
+
+- Gates first: check hard requirements
+- Graded scores next: score quality
+- Failure tags last: label how it failed
+
+But before you can run a single eval, you need an image-eval harness. Building and keeping that harness is usually what slows teams down. Time goes into runners and glue instead of into better prompts and models. Some teams skip image evals for that reason.
+
+This repo copies OpenAI's grading method and example jobs. [Pixeltable](https://www.pixeltable.com/), an open source backend for multimodal apps, replaces their custom harness packages. Details below.
 
 ## What Pixeltable replaces
 
-An image-eval harness usually does these jobs:
+OpenAI published the grading method in their [image evals writeup](https://developers.openai.com/cookbook/examples/multimodal/image_evals) and [notebook](https://github.com/openai/openai-cookbook/blob/main/examples/multimodal/image_evals.ipynb). The runnable code lives in [`examples/evals/imagegen_evals`](https://github.com/openai/openai-cookbook/tree/main/examples/evals/imagegen_evals). That folder has three packages:
 
-- Define each prompt to run, plus model settings and score shapes
-- Call generate or edit and collect outputs
-- Store images and track paths
-- Encode images for the judge
-- Wire LLM-as-judge calls
-- Sweep model settings
-- Loop over prompts and models, then compare results
+| Package | How it works | Use cases |
+|---------|--------------|-----------|
+| `vision_harness/` | Base library. You pass prompts, models, and a grader. It calls generate or edit, saves images, and runs the judge. It is not a finished eval by itself. | — |
+| `generation_harness/` | Uses `vision_harness/` to evaluate text-to-image outputs. | UI mockups, marketing flyers |
+| `editing_harness/` | Uses `vision_harness/` to evaluate image-edit outputs. | Virtual try-on, logo changes |
 
-OpenAI's cookbook includes one concrete harness for that, a Python package named `vision_harness/`:
+Pixeltable replaces those three packages.
 
-- Writeup: [Image Evals for Image Generation and Editing Use Cases](https://developers.openai.com/cookbook/examples/multimodal/image_evals)
-- Code: [`examples/evals/imagegen_evals`](https://github.com/openai/openai-cookbook/tree/main/examples/evals/imagegen_evals) in the [openai-cookbook](https://github.com/openai/openai-cookbook) repo (notebook: [`image_evals.ipynb`](https://github.com/openai/openai-cookbook/blob/main/examples/multimodal/image_evals.ipynb))
+It replaces `vision_harness/` as the evaluate loop. It stores your inputs, calls generate or edit, saves images, and runs the judge.
 
-In this repo you do not copy or maintain that package. Pixeltable takes those jobs. In Python you open the tables with `pxt.get_table('img_eval/images')` and `pxt.get_table('img_eval/evals')`, then:
+It replaces `generation_harness/` and `editing_harness/` because one schema covers all four use cases. You do not need a separate CLI package for text-to-image and another for edits.
 
-1. Declare the tables once in [`schema.py`](schema.py). Each row in `img_eval/images` is one prompt to generate or edit, plus model settings, optional reference images, and the output image. `img_eval/evals` is a filtered view of rows you mark ready to grade.
-2. Call `images.insert([...])` on `img_eval/images`. Computed columns call the image APIs and store the output image on that row. No runner script. No hand-managed PNG folder.
-3. Call `images.update({'eval_ready': True}, ...)` on those rows when you want scores. The `img_eval/evals` view runs the vision judge and fills in scores, verdict, and tags. No evaluate loop over prompts and models.
-4. To try another model or prompt, update fields on an existing row in `img_eval/images` (inputs are mutable) or insert another row. Comparison is `evals.select(...).collect()` on `img_eval/evals`, not stitching JSON from a results directory.
+### What you do instead
 
-You still write and tune the grading method, prompts, criteria, judge rubrics, JSON score schemas, pass rules, required text lists, reference images, and which model and settings to run. That content comes from the cookbook. Only the runtime changes.
+Open the tables with `pxt.get_table('img_eval/images')` and `pxt.get_table('img_eval/evals')`.
+
+1. Declare the tables once in [`schema.py`](schema.py). Each row in `img_eval/images` holds one prompt, model settings, optional reference images, and the output image. `img_eval/evals` shows only rows marked ready to grade.
+2. Insert into `img_eval/images`. Pixeltable calls the image APIs and stores the output image on that row.
+3. Set `eval_ready=True` when you want scores. The `evals` view runs the judge and fills in scores, verdict, and tags.
+4. To try another model or prompt, update fields on an existing row (inputs are mutable) or insert another row. Compare with a query on `img_eval/evals`.
+
+You still write the prompts, criteria, rubrics, pass rules, required text, reference images, and model choices. That content comes from the cookbook. Only the runtime changes.
 
 ## Start here (about 5 minutes)
 
