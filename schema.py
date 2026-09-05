@@ -1,14 +1,18 @@
 """Class-based Pixeltable schema for the image eval harness.
 
-Produce (udfs.produce_image):
-  - seed_image if set (demo / already-generated) — no provider call
-  - image_generation → openai.image_generations
-  - image_editing → gemini.generate_content([ref images…, prompt])  # multi-image OK
+Two base tables, split by operation, each producing its image with a built-in
+Pixeltable provider function and a constant model, so the provider and model are
+part of the schema:
+  - generations.image via pxtf.openai.image_generations  (GEN_MODEL)
+  - edits.image        via pxtf.gemini.generate_content   (EDIT_MODEL)
 
-Judge (this file):
-  - openai.responses with input_image = Images.image (Pixeltable encodes PIL)
-  - https://docs.pixeltable.com/howto/providers/working-with-openai#responses-api
-  - model must be a constant here (Responses resource pool); change JUDGE_MODEL below
+Each base table has a view over its eval_ready rows that runs the vision judge
+(pxtf.openai.responses with JUDGE_MODEL). The judge returns a JSON string; one
+udfs.parse_json turns it into an object, after which the fields are native
+Pixeltable access (scores.verdict, scores.reason).
+
+The provider functions need a constant model for resource-pool resolution, so
+the three models are constants here, not per-row columns.
 
 Apply with:
     uv run pxt schema update schema.py img_eval --allow-destructive -f
@@ -17,69 +21,112 @@ Apply with:
 from __future__ import annotations
 
 import pixeltable as pxt
-from pixeltable.functions import openai
+import pixeltable.functions as pxtf
 
 import udfs
 
 TableModel = pxt.model_base()
 
-# openai.responses requires a constant model for resource-pool resolution
-JUDGE_MODEL = 'gpt-5.2'
+JUDGE_MODEL = 'gpt-5.2'                 # OpenAI vision judge
+GEN_MODEL = 'gpt-image-1.5'            # OpenAI text-to-image
+GEN_SIZE = '1024x1024'
+EDIT_MODEL = 'gemini-2.5-flash-image'  # Gemini image edit
+_EDIT_CONFIG = {'response_modalities': ['IMAGE']}
 
 
-class Images(TableModel, name='images'):
-    """Base table: inputs + produced image."""
+class Generations(TableModel, name='generations'):
+    """Text-to-image rows: ui_mockup, marketing_flyer."""
 
     case_id: pxt.Required[pxt.String]
     batch_id: pxt.String
-    workflow: pxt.Required[pxt.String]  # ui_mockup | marketing_flyer | virtual_try_on | logo_edit
-    task_type: pxt.Required[pxt.String]  # image_generation | image_editing
+    workflow: pxt.Required[pxt.String]  # ui_mockup | marketing_flyer
 
-    gen_prompt: pxt.String
-    model: pxt.String  # OpenAI image model for generation (e.g. gpt-image-1.5)
-    size: pxt.String
-    edit_model: pxt.String  # Gemini image model for editing (e.g. gemini-2.5-flash-image)
-    judge_model: pxt.String  # recorded on the row; scoring uses JUDGE_MODEL above
-
-    seed_image: pxt.Image
-    ref_image: pxt.Image
-    ref_image_2: pxt.Image
-
-    prompt: pxt.Required[pxt.String]
+    gen_prompt: pxt.Required[pxt.String]  # sent to the image model
+    prompt: pxt.Required[pxt.String]      # shown to the judge
     criteria: pxt.Required[pxt.String]
-    required_text: pxt.Json
+    required_text: pxt.Json               # marketing only
 
     eval_ready: pxt.Required[pxt.Bool]
 
-    image = udfs.produce_image(
-        seed_image, task_type, gen_prompt, ref_image, ref_image_2, model, edit_model, size
-    )
+    image = pxtf.openai.image_generations(
+        gen_prompt, model=GEN_MODEL, model_kwargs={'size': GEN_SIZE}
+    )['data'][0]
 
 
-class Evals(TableModel, name='evals', base=Images.where(Images.eval_ready == True)):  # noqa: E712
-    """View over ready rows: judge via OpenAI Responses API."""
+class Edits(TableModel, name='edits'):
+    """Image-edit rows: virtual_try_on, logo_edit."""
 
-    judge_raw = openai.responses(
+    case_id: pxt.Required[pxt.String]
+    batch_id: pxt.String
+    workflow: pxt.Required[pxt.String]  # virtual_try_on | logo_edit
+
+    gen_prompt: pxt.Required[pxt.String]  # edit instruction for the model
+    prompt: pxt.Required[pxt.String]      # shown to the judge
+    criteria: pxt.Required[pxt.String]
+
+    ref_image: pxt.Required[pxt.Image]
+    ref_image_2: pxt.Image                # optional second reference (try-on)
+
+    eval_ready: pxt.Required[pxt.Bool]
+
+    image = pxtf.gemini.generate_content(
+        udfs.edit_contents(ref_image, ref_image_2, gen_prompt),
+        model=EDIT_MODEL,
+        config=_EDIT_CONFIG,
+    ).candidates[0].content.parts[0].inline_data.data.astype(pxt.Image)
+
+
+class GenEvals(TableModel, name='gen_evals', base=Generations.where(Generations.eval_ready == True)):  # noqa: E712
+    """Judge view for generations, including the marketing exact-text check."""
+
+    judge_raw = pxtf.openai.responses(
         [
             {
                 'role': 'user',
                 'content': [
-                    {'type': 'input_text', 'text': udfs.judge_user_text(Images.prompt, Images.criteria)},
-                    {'type': 'input_image', 'image_url': Images.image},
+                    {'type': 'input_text', 'text': udfs.judge_user_text(Generations.prompt, Generations.criteria)},
+                    {'type': 'input_image', 'image_url': Generations.image},
                 ],
             }
         ],
         model=JUDGE_MODEL,
         model_kwargs={
-            'instructions': udfs.judge_instructions(Images.workflow),
-            'text': udfs.judge_text_format(Images.workflow),
+            'instructions': udfs.judge_instructions(Generations.workflow),
+            'text': udfs.judge_text_format(Generations.workflow),
         },
     )
     scores = udfs.parse_json(judge_raw.output_text)
-    judge_verdict = udfs.score_str(scores, 'verdict')
-    reason = udfs.score_str(scores, 'reason')
+    judge_verdict = scores.verdict
+    reason = scores.reason
 
-    extracted_text = udfs.extract_flyer_text(Images.image, Images.workflow, JUDGE_MODEL)
-    text_check = udfs.compare_required_text(extracted_text, Images.required_text)
-    verdict = udfs.finalize_verdict(Images.workflow, scores, text_check)
-    tags = udfs.failure_tags(Images.workflow, scores, text_check)
+    extracted_text = udfs.extract_flyer_text(Generations.image, Generations.workflow, JUDGE_MODEL)
+    text_check = udfs.compare_required_text(extracted_text, Generations.required_text)
+    verdict = udfs.finalize_verdict(Generations.workflow, scores, text_check)
+    tags = udfs.failure_tags(Generations.workflow, scores, text_check)
+
+
+class EditEvals(TableModel, name='edit_evals', base=Edits.where(Edits.eval_ready == True)):  # noqa: E712
+    """Judge view for edits. No exact-text check."""
+
+    judge_raw = pxtf.openai.responses(
+        [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'input_text', 'text': udfs.judge_user_text(Edits.prompt, Edits.criteria)},
+                    {'type': 'input_image', 'image_url': Edits.image},
+                ],
+            }
+        ],
+        model=JUDGE_MODEL,
+        model_kwargs={
+            'instructions': udfs.judge_instructions(Edits.workflow),
+            'text': udfs.judge_text_format(Edits.workflow),
+        },
+    )
+    scores = udfs.parse_json(judge_raw.output_text)
+    judge_verdict = scores.verdict
+    reason = scores.reason
+
+    verdict = udfs.finalize_verdict(Edits.workflow, scores, None)
+    tags = udfs.failure_tags(Edits.workflow, scores, None)

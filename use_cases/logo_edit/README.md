@@ -1,89 +1,82 @@
 # Logo editing
 
-Edit: change specific logo text while preserving everything else, then grade with strict thresholds (near-misses fail).
+Edit specific text in a logo while keeping everything else the same, then grade the result with strict thresholds. Near misses fail.
 
-Shared tables: `img_eval/images` → set `eval_ready` → `img_eval/evals`.  
-`workflow` must be `"logo_edit"`.
+Logo edits are image-edit rows, so they live in `img_eval/edits` and grade through `img_eval/edit_evals`. You set `eval_ready` on a row to move it into the view. The `workflow` field must be `"logo_edit"`.
 
-## Inputs (you set on the row)
+## Inputs you set on the row
 
 | Column | Required | What it is |
 |--------|----------|------------|
-| `case_id` | yes | e.g. `logo_year_edit` |
-| `batch_id` | no | Group rows |
+| `case_id` | yes | For example `logo_year_edit`. |
+| `batch_id` | no | Groups rows. |
 | `workflow` | yes | `"logo_edit"` |
-| `task_type` | yes | `"image_editing"` |
-| `gen_prompt` | for new edits | Narrow edit instruction |
-| `prompt` | yes | Same instruction for the judge |
-| `criteria` | yes | What “good” means for the judge |
-| `ref_image` | for new edits | Source logo ([`assets/logo_input.png`](assets/logo_input.png)) |
-| `edit_model` | for new edits | Gemini image model, e.g. `gemini-2.5-flash-image` |
-| `judge_model` | yes | e.g. `gpt-5.2` |
-| `seed_image` | no | Already-edited output (`demo_output.png` for demo) |
-| `eval_ready` | yes | `False` until you want scores |
+| `gen_prompt` | yes | The narrow edit instruction. |
+| `prompt` | yes | The instruction shown to the judge. |
+| `criteria` | yes | What good means for the judge. |
+| `ref_image` | yes | The source logo. See [`assets/logo_input.png`](assets/logo_input.png). |
+| `eval_ready` | yes | `False` until you want scores. |
 
-Demo edit: change text **FIELD → BUTTER**, change nothing else. Prompts: [`examples.json`](examples.json).
+A logo edit uses a single reference image, so leave `ref_image_2` unset. The edit model is set once in [`schema.py`](../../schema.py) as `EDIT_MODEL`. The demo edit changes the text FIELD to BUTTER and changes nothing else. The prompts are in [`examples.json`](examples.json).
 
-## Outputs (computed)
+## Outputs the harness computes
 
-On `images`:
+On `edits`:
 
 | Column | Meaning |
 |--------|---------|
-| `image` | Seeded edit result, or new edit from `ref_image` + `gen_prompt` |
+| `image` | The edit made from `ref_image` and `gen_prompt` by `gemini.generate_content`. |
 
-On `evals` (when `eval_ready=True`):
+On `edit_evals`, when `eval_ready=True`:
 
 | Column | Meaning |
 |--------|---------|
-| `scores` | Judge JSON: `edit_intent_correctness`, `non_target_invariance`, `character_and_style_integrity`, `verdict`, `reason` (each metric 0–5) |
-| `verdict` | `PASS` only if every metric ≥ 4; else `FAIL` |
-| `reason` | Judge explanation |
-| `tags` | e.g. `edit_miss`, `edit_spill`, `style_drift` |
+| `scores` | The judge JSON: `edit_intent_correctness`, `non_target_invariance`, `character_and_style_integrity`, `verdict`, `reason`. Each metric is 0 to 5. |
+| `verdict` | `PASS` only if every metric is 4 or higher, otherwise `FAIL`. |
+| `reason` | The judge's explanation. |
+| `tags` | For example `edit_miss`, `edit_spill`, `style_drift`. |
 
-Cookbook demo often **FAIL**s on spill (background/style drift) even when the text change is right — that is expected with these thresholds.
+The cookbook demo often fails on spill, which is a change to the background or style, even when the text change is correct. That is expected with these thresholds.
 
-Judge prompt, schema, and gate rules: [`rubric.py`](rubric.py).  
-Scoring uses `openai.responses` in [`schema.py`](../../schema.py); edits use Gemini (`edit_model`).
+The judge prompt, schema, and gate rules are in [`rubric.py`](rubric.py). The scoring runs through `openai.responses` in [`schema.py`](../../schema.py). The edit uses Gemini.
 
 ## Actions
 
-**Grade the seeded demo edit:**
+Grade the demo edit, which was generated when you ran `scripts/seed_demo.py`:
 
 ```python
 import udfs
 import pixeltable as pxt
-images = pxt.get_table('img_eval/images')
-evals = pxt.get_table('img_eval/evals')
-images.update({'eval_ready': True}, where=images.case_id == 'logo_year_edit')
-evals.where(evals.case_id == 'logo_year_edit').select(
-    evals.verdict, evals.scores, evals.tags, evals.reason
+edits = pxt.get_table('img_eval/edits')
+edit_evals = pxt.get_table('img_eval/edit_evals')
+edits.update({'eval_ready': True}, where=edits.case_id == 'logo_year_edit')
+edit_evals.where(edit_evals.case_id == 'logo_year_edit').select(
+    edit_evals.image, edit_evals.verdict, edit_evals.scores, edit_evals.tags, edit_evals.reason
 ).collect()
 ```
 
-**Run a new logo edit, then grade** (omit `seed_image`):
+Run a new logo edit and grade it. Inserting runs the edit model:
 
 ```python
-images.insert([{
-    'case_id': 'logo_butter_v2',
-    'batch_id': 'run_2',
-    'workflow': 'logo_edit',
-    'task_type': 'image_editing',
-    'gen_prompt': 'Edit the logo by changing the text from FIELD to BUTTER. Do not change any other text, colors, shapes, or layout.',
-    'prompt': 'Edit the logo by changing the text from FIELD to BUTTER. Do not change any other text, colors, shapes, or layout.',
-    'criteria': 'Exact edit; non-target unchanged; style preserved.',
-    'ref_image': 'use_cases/logo_edit/assets/logo_input.png',
-    'edit_model': 'gemini-2.5-flash-image',
-    'judge_model': 'gpt-5.2',
-    'eval_ready': False,
-}])
-images.update({'eval_ready': True}, where=images.case_id == 'logo_butter_v2')
+edits.insert(
+    case_id='logo_butter_v2',
+    batch_id='run_2',
+    workflow='logo_edit',
+    gen_prompt='Edit the logo by changing the text from FIELD to BUTTER. Do not change any other text, colors, shapes, or layout.',
+    prompt='Edit the logo by changing the text from FIELD to BUTTER. Do not change any other text, colors, shapes, or layout.',
+    criteria='Exact edit; non-target unchanged; style preserved.',
+    ref_image='use_cases/logo_edit/assets/logo_input.png',
+    eval_ready=True,
+)
+edit_evals.where(edit_evals.case_id == 'logo_butter_v2').select(
+    edit_evals.image, edit_evals.verdict, edit_evals.scores, edit_evals.tags
+).collect()
 ```
 
-**Re-grade:**
+Re-grade. Recompute the judge column:
 
 ```python
-evals.recompute_columns(columns=['scores'], where=evals.case_id == 'logo_year_edit')
+edit_evals.recompute_columns(columns=['judge_raw'], where=edit_evals.case_id == 'logo_year_edit')
 ```
 
-**Tune:** inputs on a row are mutable. `images.update(...)` a prompt, `ref_image`, or model on an existing row and recompute. Or replace [`assets/logo_input.png`](assets/logo_input.png), or edit thresholds in [`rubric.py`](rubric.py).
+To tune the job, remember that the inputs on a row are mutable. Call `edits.update(...)` to change a prompt or the `ref_image` on an existing row, then recompute. You can also replace [`assets/logo_input.png`](assets/logo_input.png), or edit the thresholds in [`rubric.py`](rubric.py).

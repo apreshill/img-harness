@@ -1,22 +1,31 @@
 """UDFs for the image-eval schema.
 
-Judge scoring uses Pixeltable openai.responses in schema.py (PIL on
-input_image — Pixeltable encodes it).
+The provider calls live in schema.py as computed columns that use the built-in
+Pixeltable functions, so the provider and model are part of the schema:
+  - generations.image via pxtf.openai.image_generations (constant model)
+  - edits.image via pxtf.gemini.generate_content (constant model)
 
-Produce is routed here so seed_image short-circuits without provider calls:
-  - image_generation → openai.image_generations (stock .aexec)
-  - image_editing → gemini.generate_content with image list (stock .aexec)
+These UDFs are the judge logic and one small data-prep helper:
+  - edit_contents assembles the Gemini edit input (reference images then the
+    instruction) and drops a missing second reference.
+  - the judge helpers parse the judge JSON and apply each rubric's gates and tags.
+  - extract_flyer_text reads the flyer copy for the marketing exact-text check.
+    It calls the built-in openai.responses, and it runs only for marketing rows.
+
+Editing uses Gemini because generate_content takes several reference images in
+one call, which virtual try-on needs (person plus garment). The stock OpenAI
+image-edit function takes a single image. See the README for the plan to move
+editing to OpenAI once the multi-image edit path is confirmed against the live API.
 
 Per-job gates/tags: use_cases/<name>/rubric.py
 """
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 import json
 
 import pixeltable as pxt
+import pixeltable.functions as pxtf
 from PIL import Image
 
 from use_cases.logo_edit import rubric as logo_rubric
@@ -32,7 +41,6 @@ _RUBRICS = {
     'logo_edit': logo_rubric,
 }
 
-_GEMINI_IMAGE_CONFIG = {'response_modalities': ['IMAGE']}
 _OCR_INSTRUCTIONS = (
     'List every piece of text visible in this flyer image. '
     'Return one line per text item and preserve capitalization, punctuation, and spacing exactly.'
@@ -46,73 +54,16 @@ def _rubric(workflow: str):
     return rubric
 
 
-def _run(coro):
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
-
-
-def _first_gemini_image(response: dict) -> Image.Image:
-    for candidate in response.get('candidates') or []:
-        content = candidate.get('content') or {}
-        for part in content.get('parts') or []:
-            blob = part.get('inline_data') or {}
-            data = blob.get('data')
-            if isinstance(data, Image.Image):
-                return data
-            if isinstance(data, (bytes, bytearray)):
-                import io
-
-                img = Image.open(io.BytesIO(data))
-                img.load()
-                return img
-    raise RuntimeError('Gemini response contained no image')
-
-
-@pxt.udf(is_deterministic=False)
-def produce_image(
-    seed_image: Image.Image | None,
-    task_type: str,
-    gen_prompt: str | None,
-    ref_image: Image.Image | None,
-    ref_image_2: Image.Image | None,
-    model: str | None,
-    edit_model: str | None,
-    size: str | None,
-) -> Image.Image:
-    """seed_image if set; else OpenAI generate or Gemini edit (stock Pixeltable UDFs)."""
-    if seed_image is not None:
-        return seed_image
-
-    if task_type == 'image_generation':
-        if not gen_prompt:
-            raise ValueError('gen_prompt is required for image_generation when seed_image is unset')
-        if not model:
-            raise ValueError('model is required for image_generation')
-        from pixeltable.functions.openai import image_generations
-
-        model_kwargs = {'size': size} if size else None
-        resp = _run(image_generations.aexec(gen_prompt, model=model, model_kwargs=model_kwargs))
-        return resp['data'][0]
-
-    if task_type == 'image_editing':
-        if ref_image is None:
-            raise ValueError('ref_image is required for image_editing when seed_image is unset')
-        if not edit_model:
-            raise ValueError('edit_model is required for image_editing (Gemini image model)')
-        from pixeltable.functions.gemini import generate_content
-
-        contents: list = [ref_image]
-        if ref_image_2 is not None:
-            contents.append(ref_image_2)
-        contents.append(gen_prompt or '')
-        resp = _run(generate_content.aexec(contents, model=edit_model, config=_GEMINI_IMAGE_CONFIG))
-        return _first_gemini_image(resp)
-
-    raise ValueError(f'unknown task_type: {task_type}')
+@pxt.udf
+def edit_contents(
+    ref_image: Image.Image, ref_image_2: Image.Image | None, prompt: str | None
+) -> list:
+    """Build the Gemini edit input: reference images, then the instruction."""
+    contents: list = [ref_image]
+    if ref_image_2 is not None:
+        contents.append(ref_image_2)
+    contents.append(prompt or '')
+    return contents
 
 
 @pxt.udf
@@ -140,37 +91,29 @@ def judge_user_text(prompt: str, criteria: str) -> str:
 
 @pxt.udf
 def parse_json(text: str | None) -> dict:
+    """Turn the judge's JSON string into an object. After this, fields are native
+    Pixeltable access, e.g. scores.verdict. Pixeltable has no native string-to-JSON
+    parser, so this one json.loads is the only parse step."""
     if not text:
         return {}
     return json.loads(text)
 
 
-@pxt.udf
-def score_str(scores: dict | None, key: str) -> str | None:
-    if not scores:
-        return None
-    val = scores.get(key)
-    return None if val is None else str(val)
-
-
 @pxt.udf(is_deterministic=False)
-def extract_flyer_text(image: Image.Image, workflow: str, judge_model: str) -> list[str] | None:
-    """Marketing only — OpenAI Responses via stock UDF (PIL in input_image)."""
+async def extract_flyer_text(image: Image.Image, workflow: str, judge_model: str) -> list[str] | None:
+    """Marketing only — read the flyer copy with the built-in openai.responses."""
     if workflow != 'marketing_flyer':
         return None
-    from pixeltable.functions.openai import responses
 
-    raw = _run(
-        responses.aexec(
-            [
-                {
-                    'role': 'user',
-                    'content': [{'type': 'input_image', 'image_url': image}],
-                }
-            ],
-            model=judge_model,
-            model_kwargs={'instructions': _OCR_INSTRUCTIONS},
-        )
+    raw = await pxtf.openai.responses.aexec(
+        [
+            {
+                'role': 'user',
+                'content': [{'type': 'input_image', 'image_url': image}],
+            }
+        ],
+        model=judge_model,
+        model_kwargs={'instructions': _OCR_INSTRUCTIONS},
     )
     text = raw.get('output_text') if isinstance(raw, dict) else None
     if not text:
